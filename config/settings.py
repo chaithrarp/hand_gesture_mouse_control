@@ -38,16 +38,8 @@ class CameraSettings:
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class DetectionSettings:
-    # Lower detection_confidence → finds hand in more lighting conditions
-    # but may produce false positives
     detection_confidence: float = 0.60
-
-    # Lower tracking_confidence → keeps track through fast motion
-    # but may drift slightly
     tracking_confidence: float  = 0.45
-
-    # Ignore landmarks below this visibility (webcams often give ~0.1 even
-    # for clearly visible points — keep this very low)
     visibility_threshold: float = 0.05
 
     def __post_init__(self):
@@ -61,45 +53,15 @@ class DetectionSettings:
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class CursorSettings:
-    # ── Speed ──────────────────────────────────────────────────────────────
-    # Multiplier on raw camera-to-screen mapping.
-    # 1.0 = hand must cross full active zone to cross full screen.
-    # 1.5 = faster — smaller hand movements needed.
     speed: float = 1.2
-
-    # ── Smoothing ──────────────────────────────────────────────────────────
-    # Lerp factor applied AFTER Kalman. 0=frozen, 1=raw/instant.
-    # Lower = smoother path but more lag. 0.35-0.55 is the sweet spot.
     smoothing: float = 0.45
-
-    # ── Adaptive smoothing ─────────────────────────────────────────────────
-    # When hand moves fast, reduce smoothing so cursor keeps up.
-    # When hand is slow/still, increase smoothing to kill jitter.
-    # Set False to use fixed smoothing above.
     adaptive_smoothing: bool = True
-
-    # Pixel/frame velocity above which smoothing is halved (fast mode)
     adaptive_fast_threshold: float = 18.0
-
-    # Pixel/frame velocity below which smoothing is doubled (hover mode)
     adaptive_slow_threshold: float = 4.0
-
-    # ── Dead zone ──────────────────────────────────────────────────────────
-    # Cursor won't move unless it would move more than this many pixels.
-    # Kills jitter on a stationary hand. Keep small — large values make
-    # cursor feel "sticky".
     dead_zone_px: int = 3
-
-    # ── Hover lock ─────────────────────────────────────────────────────────
-    # If hand velocity < hover_velocity_threshold for hover_lock_ms,
-    # cursor position is frozen (eliminates jitter during targeting).
     hover_lock_enabled: bool  = True
-    hover_velocity_threshold: float = 3.5   # px/frame — below this = hovering
-    hover_lock_ms: int        = 180          # ms stationary before lock engages
-
-    # ── Active zone mapping ────────────────────────────────────────────────
-    # Fraction of frame that maps to full screen. Shrink to need less
-    # hand movement; expand for more precision.
+    hover_velocity_threshold: float = 3.5
+    hover_lock_ms: int        = 180
     active_zone_x: Tuple[float, float] = (0.05, 0.95)
     active_zone_y: Tuple[float, float] = (0.05, 0.95)
 
@@ -117,27 +79,12 @@ class CursorSettings:
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class GestureSettings:
-    # Pinch sensitivity: fraction of hand_size for thumb-index contact.
-    # Lower = need to pinch tighter. Higher = triggers more easily.
     pinch_sensitivity: float = 0.28
-
-    # How firmly fingers must extend to count as "up".
-    # Lower = more lenient (better for fast motion).
-    # Higher = stricter (fewer false extends).
     extend_sensitivity: float = 0.12
-
-    # Seconds a gesture must be held before it's accepted.
-    # Prevents flicker when transitioning between gestures.
     debounce_s: float = 0.08
-
-    # ── Click ──────────────────────────────────────────────────────────────
-    click_min_hold_s: float = 0.06   # below this = accidental brush
-    click_max_hold_s: float = 1.4    # above this = drag, not click
-
-    # ── Drag ───────────────────────────────────────────────────────────────
-    drag_lock_s: float = 0.45        # pinch held this long → drag mode
-
-    # ── Right click ────────────────────────────────────────────────────────
+    click_min_hold_s: float = 0.06
+    click_max_hold_s: float = 1.4
+    drag_lock_s: float = 0.45
     right_click_debounce_s: float = 0.9
 
     def __post_init__(self):
@@ -151,28 +98,46 @@ class GestureSettings:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCROLL  — feel of open-hand scroll
+# FIX LOG:
+#   pixels_per_tick  lowered  22 → 12   (scroll fires more often = feels faster)
+#   speed_multiplier float    1→3 range (was int, couldn't fine-tune)
+#   accumulation_smooth raised 0.18→0.35 (delta bleeds in faster = less "stuck")
+#   rolling_ref      NEW      True = ref_y follows hand so scroll doesn't stall
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class ScrollSettings:
     # How many pixels of hand movement = one scroll tick.
     # Lower = more sensitive (scrolls faster with less movement).
-    pixels_per_tick: float = 22.0
+    # Was 22.0 — lowered to 12.0 so scroll fires more readily.
+    pixels_per_tick: float = 12.0
 
     # Multiplier on scroll ticks sent to OS.
-    # 1 = one OS scroll event per tick. 3 = three events (faster page scroll).
-    speed_multiplier: int = 2
+    # Now FLOAT so you can dial between 1.0 and 5.0 precisely.
+    # Was int (2), now float default 2.5.
+    speed_multiplier: float = 2.5
 
-    # Smoothing on scroll delta accumulation (0=instant, 1=never fires).
-    # Prevents single-frame jitter from triggering a scroll.
-    accumulation_smooth: float = 0.18
+    # Smoothing on scroll delta accumulation.
+    # Higher = delta bleeds in faster = less "stuck" feeling.
+    # Was 0.18 — raised to 0.35.
+    accumulation_smooth: float = 0.35
 
     # Direction: True = natural (hand down → page down), False = inverted
     natural_direction: bool = True
 
+    # Rolling reference: if True, ref_y slowly follows the hand so scroll
+    # doesn't stall when you move beyond the initial anchor point.
+    # This was the main cause of "scroll stops working mid-gesture".
+    rolling_ref: bool = True
+
+    # How fast ref_y follows hand (lerp factor, 0=never follows, 1=instant).
+    # Keep low (0.05-0.12) so it trails, not snaps.
+    rolling_ref_lerp: float = 0.08
+
     def __post_init__(self):
-        self.pixels_per_tick      = max(5.0,  min(80.0, self.pixels_per_tick))
-        self.speed_multiplier     = max(1,     min(10,   self.speed_multiplier))
-        self.accumulation_smooth  = max(0.05,  min(0.5,  self.accumulation_smooth))
+        self.pixels_per_tick      = max(3.0,  min(80.0, self.pixels_per_tick))
+        self.speed_multiplier     = max(0.5,  min(10.0, self.speed_multiplier))
+        self.accumulation_smooth  = max(0.05, min(0.8,  self.accumulation_smooth))
+        self.rolling_ref_lerp     = max(0.01, min(0.3,  self.rolling_ref_lerp))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -180,14 +145,7 @@ class ScrollSettings:
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class KalmanSettings:
-    # Process noise: how much we expect the hand to accelerate between frames.
-    # Lower → smoother output, more lag on direction changes.
-    # Higher → snappier, follows raw input more closely.
     process_noise: float = 0.08
-
-    # Measurement noise: how much we trust the raw landmark position.
-    # Lower → trust camera more (less filtering).
-    # Higher → distrust camera more (more smoothing).
     measurement_noise: float = 0.08
 
     def __post_init__(self):
@@ -200,17 +158,9 @@ class KalmanSettings:
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class PerformanceSettings:
-    # Resize frame before sending to MediaPipe.
-    # Does NOT affect display frame — only the inference input.
-    # Smaller = faster detection, less accuracy. 640x360 is the sweet spot.
     inference_width: int  = 640
     inference_height: int = 360
-
-    # Skip MediaPipe inference every N frames when no hand was detected
-    # last frame. Saves CPU on idle frames. 1 = never skip (always infer).
     idle_skip_frames: int = 2
-
-    # Max CPU threads MediaPipe may use. 0 = auto.
     mp_threads: int = 0
 
     def __post_init__(self):
@@ -233,14 +183,13 @@ class Settings:
     performance: PerformanceSettings = field(default_factory=PerformanceSettings)
 
     def summary(self) -> str:
-        """Human-readable dump for logging on startup."""
         lines = ["── Settings ──────────────────────────────"]
         lines.append(f"  Camera      : {self.camera.width}x{self.camera.height} @ {self.camera.fps}fps  idx={self.camera.index}")
         lines.append(f"  Detection   : conf={self.detection.detection_confidence}  track={self.detection.tracking_confidence}")
         lines.append(f"  Cursor      : speed={self.cursor.speed}  smooth={self.cursor.smoothing}  adaptive={self.cursor.adaptive_smoothing}")
         lines.append(f"  Dead zone   : {self.cursor.dead_zone_px}px  hover_lock={self.cursor.hover_lock_enabled} ({self.cursor.hover_lock_ms}ms)")
         lines.append(f"  Gesture     : pinch={self.gesture.pinch_sensitivity}  extend={self.gesture.extend_sensitivity}  debounce={self.gesture.debounce_s}s")
-        lines.append(f"  Scroll      : {self.scroll.pixels_per_tick}px/tick  x{self.scroll.speed_multiplier}  natural={self.scroll.natural_direction}")
+        lines.append(f"  Scroll      : {self.scroll.pixels_per_tick}px/tick  x{self.scroll.speed_multiplier}  natural={self.scroll.natural_direction}  rolling={self.scroll.rolling_ref}")
         lines.append(f"  Kalman      : process={self.kalman.process_noise}  measure={self.kalman.measurement_noise}")
         lines.append(f"  Inference   : {self.performance.inference_width}x{self.performance.inference_height}  skip={self.performance.idle_skip_frames}")
         lines.append("──────────────────────────────────────────")
@@ -248,5 +197,4 @@ class Settings:
 
 
 # ── Module-level default instance ─────────────────────────────────────────────
-# Import this anywhere: `from config.settings import settings`
 settings = Settings()

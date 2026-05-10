@@ -16,7 +16,8 @@ Hotkeys
   T         toggle gesture guide overlay
   R         restart tutorial
   S         skip tutorial (during tutorial only)
-  P         toggle settings sidebar
+  P         toggle settings sidebar (read-only)
+  I         toggle interactive settings panel (sliders)
   C         start/cancel calibration
 
 Scroll behaviour is handled entirely inside MouseController._accumulate_scroll()
@@ -36,7 +37,6 @@ import cv2
 import numpy as np
 
 # ── stdlib shim so we can run even without the full package tree ───────────────
-# If the module tree isn't on PYTHONPATH, fall back gracefully.
 def _try_import(module: str):
     try:
         return __import__(module, fromlist=[""])
@@ -58,9 +58,6 @@ except ImportError:
     _MOUSE_OK = False
 
 # ── Project modules ────────────────────────────────────────────────────────────
-# We import from the package tree.  If the file is run from the project root
-# (python main.py) all imports below resolve normally.
-
 from config.settings import Settings
 from config import constants as C
 
@@ -72,41 +69,25 @@ from core.gesture_recognizer import (
 )
 
 from processing.filters import FilterPipeline
-
 from control.mouse_controller import MouseController
-
 from utils.calibration import CalibrationManager
 from utils.logger import get_logger
 
 log = get_logger(__name__)
 
-# ── Dashboard ──────────────────────────────────────────────────────────────────
-# ui/dashboard.py is the canonical renderer; import it.
 from ui.dashboard import Dashboard
+from ui.settings_panel import SettingsPanel
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # COORDINATE MAPPER
-# Inline here so we don't depend on core/coordinate_mapper.py existing yet.
-# If that module is added later, swap this class for the import.
 # ─────────────────────────────────────────────────────────────────────────────
 class CoordinateMapper:
-    """
-    Maps camera-pixel positions → screen-pixel positions.
-
-    Two modes:
-      • Default   — linear scale using active_zone in CursorSettings.
-      • Calibrated — homography (3×3 matrix) from CalibrationManager.
-
-    Speed multiplier (cs.speed) is applied in default mode so the user
-    can tune responsiveness from settings without touching any other code.
-    """
-
     def __init__(self, screen_w: int, screen_h: int, settings: Settings):
         self._sw  = screen_w
         self._sh  = screen_h
         self._cfg = settings
-        self._H: Optional[np.ndarray] = None   # calibration homography
+        self._H: Optional[np.ndarray] = None
 
     def set_calibration(self, H: Optional[np.ndarray]) -> None:
         self._H = H
@@ -115,7 +96,6 @@ class CoordinateMapper:
 
     def map(self, cam_x: float, cam_y: float,
             frame_w: int, frame_h: int) -> Tuple[int, int]:
-        """Return (screen_x, screen_y) clamped to screen bounds."""
         if self._H is not None:
             return self._map_homography(cam_x, cam_y)
         return self._map_linear(cam_x, cam_y, frame_w, frame_h)
@@ -130,7 +110,6 @@ class CoordinateMapper:
         nx = (cx / fw - az_x[0]) / (az_x[1] - az_x[0])
         ny = (cy / fh - az_y[0]) / (az_y[1] - az_y[0])
 
-        # Apply speed: pivot around 0.5 so centre stays centred
         nx = 0.5 + (nx - 0.5) * spd
         ny = 0.5 + (ny - 0.5) * spd
 
@@ -149,8 +128,6 @@ class CoordinateMapper:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TUTORIAL
-# ASCII-only text throughout — cv2 built-in fonts cannot render emoji or
-# Unicode beyond basic Latin.  All "???" issues are caused by emoji in text.
 # ─────────────────────────────────────────────────────────────────────────────
 TUTORIAL_STEPS = [
     {
@@ -252,7 +229,6 @@ TUTORIAL_STEPS = [
     },
 ]
 
-# Colour palette for tutorial (BGR)
 _T_BG      = (12, 10, 28)
 _T_TITLE   = (0, 220, 80)
 _T_SUB     = (0, 195, 255)
@@ -263,21 +239,16 @@ _T_DOT_OFF = (70, 70, 70)
 
 
 def draw_tutorial(frame: np.ndarray, step: int) -> np.ndarray:
-    """Render the tutorial overlay. Returns the composited frame."""
     h, w = frame.shape[:2]
-
-    # Dark overlay
     bg = np.full_like(frame, _T_BG)
     frame = cv2.addWeighted(bg, 0.92, frame, 0.08, 0)
 
     data  = TUTORIAL_STEPS[step]
     total = len(TUTORIAL_STEPS)
 
-    # ── Step counter (top-left) ────────────────────────────────────────────
     cv2.putText(frame, f"Step {step + 1} / {total}",
                 (20, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.70, _T_HINT, 1, cv2.LINE_AA)
 
-    # ── Progress dots (top-right) ──────────────────────────────────────────
     dot_r   = 7
     spacing = 22
     total_w = (total - 1) * spacing
@@ -289,29 +260,24 @@ def draw_tutorial(frame: np.ndarray, step: int) -> np.ndarray:
         if i == step:
             cv2.circle(frame, (cx, 26), dot_r + 2, _T_DOT_ON, 1, cv2.LINE_AA)
 
-    # ── Divider ────────────────────────────────────────────────────────────
     cv2.line(frame, (40, 52), (w - 40, 52), (40, 40, 60), 1)
 
-    # ── Title ─────────────────────────────────────────────────────────────
     title = data["title"]
     (tw, _), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_DUPLEX, 1.25, 2)
     cv2.putText(frame, title, ((w - tw) // 2, 105),
                 cv2.FONT_HERSHEY_DUPLEX, 1.25, _T_TITLE, 2, cv2.LINE_AA)
 
-    # ── Subtitle ───────────────────────────────────────────────────────────
     sub = data.get("subtitle", "")
     if sub:
         (sw2, _), _ = cv2.getTextSize(sub, cv2.FONT_HERSHEY_SIMPLEX, 0.80, 1)
         cv2.putText(frame, sub, ((w - sw2) // 2, 145),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.80, _T_SUB, 1, cv2.LINE_AA)
 
-    # ── Body lines ─────────────────────────────────────────────────────────
     y = 200
     for line in data["lines"]:
         if line == "":
             y += 18
             continue
-        # Distinguish hints (start with spaces / "  ")
         if line.startswith("  "):
             col   = _T_HINT
             scale = 0.72
@@ -323,7 +289,6 @@ def draw_tutorial(frame: np.ndarray, step: int) -> np.ndarray:
                     cv2.FONT_HERSHEY_SIMPLEX, scale, col, 1, cv2.LINE_AA)
         y += int(scale * 50)
 
-    # ── Bottom hint ────────────────────────────────────────────────────────
     cv2.rectangle(frame, (0, h - 32), (w, h), (18, 16, 36), -1)
     hint = "SPACE = continue    S = skip tutorial    Q = quit"
     (hw, _), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
@@ -338,9 +303,8 @@ def draw_tutorial(frame: np.ndarray, step: int) -> np.ndarray:
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class HandData:
-    """Snapshot of one hand for this frame (passed to Dashboard)."""
     label:    str
-    landmarks: object    # mediapipe landmark list
+    landmarks: object
     frame_w:  int
     frame_h:  int
 
@@ -355,24 +319,6 @@ class AppMode(Enum):
 
 
 class App:
-    """
-    Main application.  Owns the camera, MediaPipe session, and all
-    per-hand state machines.  Delegates rendering to Dashboard and
-    mouse actions to MouseController.
-
-    Frame pipeline (NORMAL mode):
-        1. Capture + flip
-        2. Resize to inference resolution → MediaPipe
-        3. For each detected hand:
-              a. FilterPipeline  (cam px → stable cam px)
-              b. CoordinateMapper (cam px → screen px)
-              c. GestureStateMachine.update() → GestureResult
-              d. MouseController.handle()
-        4. MouseController.flush()
-        5. Dashboard.draw()
-        6. imshow
-    """
-
     CAL_FILE = "calibration.npy"
 
     def __init__(self):
@@ -409,9 +355,7 @@ class App:
             self._sw, self._sh = 1920, 1080
             log.warning("pyautogui not available — mouse control disabled")
 
-        # ── Per-hand state machines (keyed by "Left" / "Right") ───────────
-        # Each hand gets its own filter pipeline and gesture state machine
-        # so state doesn't bleed between hands.
+        # ── Per-hand state machines ───────────────────────────────────────
         self._filters : Dict[str, FilterPipeline]      = {}
         self._gestures: Dict[str, GestureStateMachine] = {}
 
@@ -427,7 +371,6 @@ class App:
         # ── Coordinate mapper ─────────────────────────────────────────────
         self._mapper = CoordinateMapper(self._sw, self._sh, self._cfg)
 
-        # Load saved calibration if it exists
         H = CalibrationManager.load(self.CAL_FILE)
         if H is not None:
             self._mapper.set_calibration(H)
@@ -436,12 +379,13 @@ class App:
         # ── Calibration manager ───────────────────────────────────────────
         self._cal = CalibrationManager(self._sw, self._sh)
 
-        # ── Dashboard (UI renderer) ───────────────────────────────────────
+        # ── Dashboard ─────────────────────────────────────────────────────
         self._dashboard = Dashboard(self._cfg)
 
         # ── UI toggles ────────────────────────────────────────────────────
         self._show_guide    = False
-        self._show_settings = False   # settings sidebar (press P)
+        self._show_settings = False    # P — read-only sidebar
+        self._settings_panel = SettingsPanel(self._cfg)  # I — interactive sliders
 
         # ── Performance counters ──────────────────────────────────────────
         self._frame_count = 0
@@ -449,16 +393,15 @@ class App:
         self._fps_smooth  = 0.0
         self._frame_ms    = 0.0
 
-        # idle-skip counter (skip MediaPipe when no hand on previous frame)
         self._idle_frames   = 0
         self._last_had_hand = False
 
         log.info("Mouse: %s | Screen: %dx%d",
                  "ON" if _MOUSE_OK else "OFF (install pyautogui)",
                  self._sw, self._sh)
-        log.info("Hotkeys: Q=quit  T=guide  R=tutorial  P=settings  C=calibrate")
+        log.info("Hotkeys: Q=quit  T=guide  I=sliders  R=tutorial  P=settings  C=calibrate")
 
-    # ── Hand-state getters (lazy-init per label) ───────────────────────────────
+    # ── Hand-state getters ─────────────────────────────────────────────────────
 
     def _filter_for(self, label: str) -> FilterPipeline:
         if label not in self._filters:
@@ -487,16 +430,14 @@ class App:
                 time.sleep(0.05)
                 continue
 
-            frame = cv2.flip(frame, 1)        # mirror — feels natural
+            frame = cv2.flip(frame, 1)
             h, w  = frame.shape[:2]
             self._frame_count += 1
 
-            # ── FPS (exponential moving average) ──────────────────────────
             elapsed = time.monotonic() - self._t0
             raw_fps = self._frame_count / max(elapsed, 1e-6)
             self._fps_smooth = self._fps_smooth * 0.92 + raw_fps * 0.08
 
-            # ── Route to mode handler ──────────────────────────────────────
             if self._mode == AppMode.TUTORIAL:
                 frame = self._run_tutorial(frame)
             elif self._mode == AppMode.CALIBRATING:
@@ -504,7 +445,6 @@ class App:
             else:
                 frame = self._run_normal(frame, w, h)
 
-            # ── Frame time ─────────────────────────────────────────────────
             self._frame_ms = (time.monotonic() - t_frame_start) * 1000.0
 
             cv2.imshow("Hand Gesture Mouse Control", frame)
@@ -523,11 +463,6 @@ class App:
     # ── Calibration mode ───────────────────────────────────────────────────────
 
     def _run_calibration(self, frame: np.ndarray, w: int, h: int) -> np.ndarray:
-        """
-        Run one calibration frame.  Uses POINT gesture to drive the dwell target.
-        Falls back to raw landmark position if no gesture is detected.
-        """
-        # Run MediaPipe on full frame (need accuracy during calibration)
         rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self._hands.process(rgb)
 
@@ -537,16 +472,11 @@ class App:
             for lm_proto, handedness in zip(
                 results.multi_hand_landmarks, results.multi_handedness
             ):
-                label   = handedness.classification[0].label
                 lm_list = lm_proto.landmark
-
-                # Draw skeleton (dim during calibration)
                 self._draw_skeleton_simple(frame, lm_list, w, h, (80, 80, 80))
-
-                # Use index fingertip as pointer
                 tip = lm_list[C.LM_INDEX_TIP]
                 hand_pos = (int(tip.x * w), int(tip.y * h))
-                break   # calibrate with first detected hand only
+                break
 
         cal_result = self._cal.update(hand_pos)
         self._cal.draw(frame)
@@ -564,7 +494,7 @@ class App:
     def _run_normal(self, frame: np.ndarray, w: int, h: int) -> np.ndarray:
         ps = self._cfg.performance
 
-        # ── Idle skip (saves CPU when no hand on previous frame) ───────────
+        # ── Idle skip ─────────────────────────────────────────────────────
         skip_inference = (
             not self._last_had_hand
             and self._idle_frames < ps.idle_skip_frames
@@ -574,7 +504,6 @@ class App:
             results = None
         else:
             self._idle_frames = 0
-            # Downscale to inference resolution before MediaPipe
             inf_w, inf_h = ps.inference_width, ps.inference_height
             if w != inf_w or h != inf_h:
                 small = cv2.resize(frame, (inf_w, inf_h))
@@ -584,11 +513,10 @@ class App:
             results = self._hands.process(rgb)
 
         # ── Collect per-hand data ──────────────────────────────────────────
-        hands_data: List[HandData]      = []
+        hands_data: List[HandData]           = []
         gesture_results: List[GestureResult] = []
-        result_map: dict = {}   # label → (GestureResult, sx, sy, color)
-
-        detected_labels = set()
+        result_map: dict                     = {}
+        detected_labels: set                 = set()
 
         if results and results.multi_hand_landmarks and results.multi_handedness:
             self._last_had_hand = True
@@ -600,24 +528,17 @@ class App:
                 lm_list = lm_proto.landmark
                 detected_labels.add(label)
 
-                # Raw landmark position (camera pixels, scaled to display frame)
-                # MediaPipe returns coords normalised to inference frame —
-                # multiply by display frame size (w, h) for correct pixel position.
                 raw_x = lm_list[C.LM_INDEX_TIP].x * w
                 raw_y = lm_list[C.LM_INDEX_TIP].y * h
 
-                # ── Stage 1-4: FilterPipeline ─────────────────────────────
                 fp     = self._filter_for(label)
                 fx, fy = fp.update(raw_x, raw_y)
 
-                # ── CoordinateMapper → screen coords ──────────────────────
                 sx, sy = self._mapper.map(fx, fy, w, h)
 
-                # ── GestureStateMachine ───────────────────────────────────
-                sm     = self._gesture_sm_for(label)
-                g_res  = sm.update(lm_list, w, h)
+                sm    = self._gesture_sm_for(label)
+                g_res = sm.update(lm_list, w, h)
 
-                # ── Colours for rendering ──────────────────────────────────
                 GESTURE_COLOR = {
                     GestureType.NONE:      C.C_GRAY,
                     GestureType.POINT:     C.C_GREEN,
@@ -628,29 +549,23 @@ class App:
                 }
                 color = GESTURE_COLOR.get(g_res.gesture, C.C_GRAY)
 
-                # ── Draw skeleton on display frame ─────────────────────────
                 self._draw_skeleton_simple(frame, lm_list, w, h, color)
                 self._draw_pinch_ring(frame, lm_list, w, h, g_res)
                 self._draw_gesture_bubble(frame, g_res, color)
 
-                # ── Collect for Dashboard ──────────────────────────────────
                 hd = HandData(label=label, landmarks=lm_list,
                               frame_w=w, frame_h=h)
                 hands_data.append(hd)
                 gesture_results.append(g_res)
                 result_map[label] = (g_res, sx, sy, color)
 
-                # ── Mouse actions ──────────────────────────────────────────
-                # Right hand → cursor + click + scroll
-                # Left hand  → scroll only (when right hand is also doing something)
                 if label == "Right" or len(results.multi_hand_landmarks) == 1:
                     self._mouse.handle(g_res, sx, sy)
                 else:
-                    # Left hand — only drive scroll
                     self._mouse.handle_scroll(g_res, sy)
 
         else:
-            # No hands detected — release any held state cleanly
+            # No hands detected — release all state cleanly
             self._last_had_hand = False
             for label, sm in self._gestures.items():
                 sm.reset()
@@ -658,25 +573,30 @@ class App:
                 fp.reset()
             self._mouse.release_all()
 
-        # Reset filters for labels that disappeared this frame
+        # ── FIX: reset filters for hands that disappeared THIS frame ───────
+        # (This was accidentally removed during the patch — restored here)
         for label in list(self._filters.keys()):
             if label not in detected_labels:
                 self._filters[label].reset()
                 self._gestures[label].reset()
 
-        # Flush all queued mouse actions (done ONCE per frame, after all hands)
+        # ── Settings panel: feed cursor pos + pinch state ──────────────────
+        # Uses right hand preferentially (same hand that drives cursor).
+        # Falls back to left hand if only left is detected.
+        # Safe default (screen centre) when no hands visible.
+        _panel_cx, _panel_cy, _panel_pinch = self._sw // 2, self._sh // 2, False
+        for _lbl in ("Right", "Left"):
+            if _lbl in result_map:
+                _gr, _sx, _sy, _ = result_map[_lbl]
+                _panel_cx, _panel_cy = _sx, _sy
+                _panel_pinch = (_gr.gesture == GestureType.PINCH)
+                break
+        self._settings_panel.update(_panel_cx, _panel_cy, _panel_pinch)
+
+        # ── Flush all queued mouse actions ─────────────────────────────────
         self._mouse.flush()
 
-        # ── Dashboard (HUD + overlays) ─────────────────────────────────────
-        perf_snap = {
-            "fps_smooth":     self._fps_smooth,
-            "frame_ms_mean":  self._frame_ms,
-            "frame_ms_p95":   self._frame_ms,   # simplified — add RingBuffer later
-            "frame_ms_max":   self._frame_ms,
-            "total_frames":   self._frame_count,
-            "stages":         {},
-        }
-
+        # ── Dashboard ─────────────────────────────────────────────────────
         self._dashboard.draw(
             frame      = frame,
             fps        = self._fps_smooth,
@@ -689,16 +609,19 @@ class App:
         # ── Active zone border ─────────────────────────────────────────────
         self._draw_active_zone(frame, w, h)
 
-        # ── Settings sidebar (press P) — drawn LAST so nothing covers it ──
+        # ── Read-only sidebar (P) ──────────────────────────────────────────
         if self._show_settings:
             self._draw_settings_sidebar(frame)
+
+        # ── Interactive slider panel (I) — always drawn when visible ───────
+        # FIX: was mistakenly inside `if self._show_settings` block
+        self._settings_panel.draw(frame)
 
         return frame
 
     # ── Key handler ────────────────────────────────────────────────────────────
 
     def _handle_key(self, key: int) -> bool:
-        """Return False to quit."""
         if key in (C.KEY_QUIT, C.KEY_ESC, ord('Q')):
             return False
 
@@ -711,17 +634,18 @@ class App:
                 self._mode = AppMode.NORMAL
             return True
 
-        # Normal / calibrating mode keys  (accept both lowercase and uppercase)
-        key_lc = key | 0x20 if 65 <= key <= 90 else key   # A-Z → a-z
+        key_lc = key | 0x20 if 65 <= key <= 90 else key
 
-        if key_lc == C.KEY_GUIDE:                           # T — gesture guide
+        if key_lc == C.KEY_GUIDE:
             self._show_guide = not self._show_guide
-        elif key_lc == C.KEY_TUTORIAL:                      # R — restart tutorial
-            self._mode         = AppMode.TUTORIAL
+        elif key_lc == C.KEY_TUTORIAL:
+            self._mode          = AppMode.TUTORIAL
             self._tutorial_step = 0
-        elif key_lc == C.KEY_SETTINGS:                      # P — settings sidebar
+        elif key_lc == C.KEY_SETTINGS:
             self._show_settings = not self._show_settings
-        elif key_lc == C.KEY_CALIBRATE:                     # C — calibrate / cancel
+        elif key_lc == ord('i'):                         # I — interactive sliders
+            self._settings_panel.toggle()
+        elif key_lc == C.KEY_CALIBRATE:
             if self._mode == AppMode.CALIBRATING:
                 self._cal.cancel()
                 self._mode = AppMode.NORMAL
@@ -739,13 +663,11 @@ class App:
         self, frame: np.ndarray, lm, fw: int, fh: int, color: tuple
     ) -> None:
         h, w = frame.shape[:2]
-        # Connections
         for s, e in C.HAND_CONNECTIONS:
             ls, le = lm[s], lm[e]
             p1 = (int(ls.x * w), int(ls.y * h))
             p2 = (int(le.x * w), int(le.y * h))
             cv2.line(frame, p1, p2, color, 2, cv2.LINE_AA)
-        # Landmark dots
         tips = {C.LM_INDEX_TIP, C.LM_MIDDLE_TIP, C.LM_RING_TIP,
                 C.LM_PINKY_TIP, C.LM_THUMB_TIP}
         for i, lmk in enumerate(lm):
@@ -755,10 +677,8 @@ class App:
             cv2.circle(frame, px, r, C.C_WHITE, 1, cv2.LINE_AA)
 
     def _draw_pinch_ring(
-        self, frame: np.ndarray, lm, fw: int, fh: int,
-        res: GestureResult
+        self, frame: np.ndarray, lm, fw: int, fh: int, res: GestureResult
     ) -> None:
-        """Pulsing ring at pinch midpoint — grows as drag lock approaches."""
         if res.gesture != GestureType.PINCH:
             return
         h, w = frame.shape[:2]
@@ -774,7 +694,6 @@ class App:
     def _draw_gesture_bubble(
         self, frame: np.ndarray, res: GestureResult, color: tuple
     ) -> None:
-        """Filled label bubble above the gesture anchor point."""
         LABELS = {
             GestureType.POINT:     "POINT",
             GestureType.PINCH:     "PINCH",
@@ -787,8 +706,7 @@ class App:
             return
         x, y = res.position
         y = max(y - 30, 20)
-        (tw, th), _ = cv2.getTextSize(
-            label, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 1)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 1)
         pad = 6
         x0, y0 = x - tw // 2 - pad, y - th - pad
         x1, y1 = x + tw // 2 + pad, y + pad
@@ -798,7 +716,6 @@ class App:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, C.C_BLACK, 1, cv2.LINE_AA)
 
     def _draw_active_zone(self, frame: np.ndarray, w: int, h: int) -> None:
-        """Dashed border showing the active gesture zone."""
         cs  = self._cfg.cursor
         x0  = int(cs.active_zone_x[0] * w)
         x1  = int(cs.active_zone_x[1] * w)
@@ -826,14 +743,9 @@ class App:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, C.C_GRAY, 1, cv2.LINE_AA)
 
     def _draw_settings_sidebar(self, frame: np.ndarray) -> None:
-        """
-        RIGHT-side panel: all live-tunable Settings values with their names.
-        Drawn last so the dashboard HUD (left side) never covers it.
-        Toggled with P.
-        """
         h, w = frame.shape[:2]
         panel_w = 310
-        px = w - panel_w   # anchor to RIGHT edge
+        px = w - panel_w
 
         overlay = frame.copy()
         cv2.rectangle(overlay, (px, 0), (w, h), (8, 22, 8), -1)
@@ -896,7 +808,6 @@ class App:
             f"{ps.inference_width}x{ps.inference_height}",          y, C.C_GRAY);   y += 15
         row("idle_skip_frames",         ps.idle_skip_frames,        y, C.C_GRAY);   y += 15
 
-        # Calibration status
         cal_str = "loaded" if self._mapper._H is not None else "none (press C)"
         row("calibration",              cal_str,                    y, C.C_GRAY)
 

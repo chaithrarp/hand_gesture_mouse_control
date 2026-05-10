@@ -205,7 +205,7 @@ class Dashboard:
         # Divider + hotkeys
         cv2.line(frame, (60, y + 5), (w - 60, y + 5), C.C_GRAY, 1)
         y += 28
-        hotkeys = "Q=quit   T=guide   P=settings   C=calibrate   R=tutorial   FIST=pause"
+        hotkeys = "Q=quit   T=guide  I=sliders  P=settings   C=calibrate   R=tutorial     FIST=pause"
         ts2 = cv2.getTextSize(hotkeys, cv2.FONT_HERSHEY_SIMPLEX, 0.62, 1)[0]
         cv2.putText(frame, hotkeys, ((w - ts2[0]) // 2, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.62, C.C_GRAY, 1, cv2.LINE_AA)
@@ -263,7 +263,7 @@ class Dashboard:
     def _draw_bottom_bar(self, frame: np.ndarray, w: int, h: int) -> None:
         """Persistent hotkey reminder at the very bottom of the frame."""
         cv2.rectangle(frame, (0, h - 28), (w, h), (18, 18, 18), -1)
-        hint = "Q=quit   T=guide   P=settings   C=calibrate   R=tutorial   FIST=pause"
+        hint = "Q=quit   T=guide   I=sliders   P=settings   C=calibrate   R=tutorial   FIST=pause"
         (hw, _), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)
         cv2.putText(frame, hint, ((w - hw) // 2, h - 9),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.52, C.C_CYAN, 1, cv2.LINE_AA)

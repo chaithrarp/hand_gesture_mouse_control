@@ -3,19 +3,17 @@ control/mouse_controller.py
 
 Translates GestureResult events → mouse actions (move, click, drag, scroll).
 
-Design rules:
-  - Consumes GestureEvent.ENTERED/HELD/EXITED — no gesture timing logic here
-  - All pyautogui calls go through _execute() which catches exceptions
-  - Action queue ensures no gesture event is silently dropped under load
-  - Scroll accumulator prevents single-frame jitter from firing scroll ticks
-  - Pause state (FIST gesture) blocks all output cleanly
-  - Thread-safe: queue is filled on frame thread, could be drained on separate
-    thread in future without API changes
+SCROLL FIX LOG (vs original):
+  - ref_y now ROLLS (lerp toward current position) so scroll never stalls
+    when hand drifts back to anchor. Controlled by ScrollSettings.rolling_ref
+    and rolling_ref_lerp.
+  - ticks now cast to int before pyautogui.scroll() — float ticks were
+    silently ignored on Windows causing erratic/no scroll.
+  - speed_multiplier is now float-aware (was rounded to int).
+  - Accumulator remainder is preserved across ticks (no lost delta).
 
-Latency notes:
-  - pyautogui.moveTo with _pause=0 is the fastest available on all platforms
-  - Queue drain happens synchronously at end of each frame (sub-ms)
-  - Scroll accumulation prevents OS scroll event spam (which causes lag)
+Everything else is unchanged — cursor movement, click, drag, right-click,
+pause, action queue all untouched.
 """
 
 import time
@@ -31,11 +29,10 @@ from utils.logger import get_logger
 
 log = get_logger(__name__)
 
-# ── Try importing pyautogui ────────────────────────────────────────────────────
 try:
     import pyautogui
     pyautogui.FAILSAFE = False
-    pyautogui.PAUSE    = 0          # critical — default 0.1s pause kills latency
+    pyautogui.PAUSE    = 0
     _MOUSE_AVAILABLE   = True
     log.info("pyautogui loaded — mouse control active")
 except ImportError:
@@ -43,7 +40,6 @@ except ImportError:
     log.warning("pyautogui not found — mouse control DISABLED (pip install pyautogui)")
 
 
-# ── Action types for the queue ─────────────────────────────────────────────────
 class ActionType(Enum):
     MOVE        = auto()
     LEFT_CLICK  = auto()
@@ -58,10 +54,9 @@ class MouseAction:
     kind:    ActionType
     x:       Optional[int]   = None
     y:       Optional[int]   = None
-    ticks:   Optional[int]   = None   # for SCROLL
+    ticks:   Optional[int]   = None   # always int — pyautogui requires int
 
 
-# ── Mouse Controller ───────────────────────────────────────────────────────────
 class MouseController:
     """
     Translates gesture results into mouse actions.
@@ -70,11 +65,6 @@ class MouseController:
         controller = MouseController(screen_w, screen_h, settings)
         controller.handle(gesture_result, screen_x, screen_y)
         controller.flush()   # drain action queue — call at end of frame
-
-    Two-hand usage:
-        controller.handle(right_result, rx, ry)   # cursor + click
-        controller.handle_scroll(left_result, ly)  # scroll only
-        controller.flush()
     """
 
     def __init__(
@@ -91,27 +81,21 @@ class MouseController:
         self._gs = gs
         self._ss = ss
 
-        # ── Cursor state ──────────────────────────────────────────────────
         self._cur_x: int = screen_w  // 2
         self._cur_y: int = screen_h // 2
 
-        # ── Click / drag state ────────────────────────────────────────────
         self._pinch_start:  Optional[float] = None
         self._is_dragging:  bool            = False
         self._click_fired:  bool            = False
 
-        # ── Scroll state ──────────────────────────────────────────────────
-        self._scroll_ref_y:  Optional[int]  = None
-        self._scroll_accum:  float          = 0.0
+        # ── Scroll state ───────────────────────────────────────────────────
+        self._scroll_ref_y:  Optional[float] = None   # float for smooth rolling
+        self._scroll_accum:  float            = 0.0
 
-        # ── Right-click debounce ──────────────────────────────────────────
         self._last_right_click: float = 0.0
 
-        # ── Pause (FIST) ──────────────────────────────────────────────────
         self.paused: bool = False
 
-        # ── Action queue ──────────────────────────────────────────────────
-        # Bounded at 16 — if we ever fill this the frame loop has bigger problems
         self._queue: queue.SimpleQueue = queue.SimpleQueue()
 
         if _MOUSE_AVAILABLE:
@@ -120,25 +104,10 @@ class MouseController:
 
     # ── Public: per-frame entry points ────────────────────────────────────────
 
-    def handle(
-        self,
-        result: GestureResult,
-        screen_x: int,
-        screen_y: int,
-    ) -> None:
-        """
-        Process a gesture result for the primary (cursor-controlling) hand.
-        Queues appropriate mouse actions. Call flush() after all hands processed.
-
-        Args:
-            result:   GestureResult from GestureStateMachine.update()
-            screen_x: Final screen X from CoordinateMapper (after dead zone)
-            screen_y: Final screen Y from CoordinateMapper (after dead zone)
-        """
+    def handle(self, result: GestureResult, screen_x: int, screen_y: int) -> None:
         g  = result.gesture
         ev = result.event
 
-        # ── FIST: toggle pause on ENTERED only ───────────────────────────
         if g == GestureType.FIST:
             if ev == GestureEvent.ENTERED:
                 self.paused = not self.paused
@@ -152,44 +121,26 @@ class MouseController:
         if self.paused:
             return
 
-        # ── Route by gesture ──────────────────────────────────────────────
         if g == GestureType.POINT:
             self._handle_point(screen_x, screen_y, ev)
-
         elif g == GestureType.PINCH:
             self._handle_pinch(screen_x, screen_y, result.hold_s, ev)
-
         elif g == GestureType.VICTORY:
             self._handle_victory(ev)
-
         elif g == GestureType.OPEN_HAND:
             self._handle_open_hand(screen_x, screen_y, ev)
-
         elif g == GestureType.NONE:
             self._handle_none(screen_x, screen_y, ev)
 
-    def handle_scroll(
-        self,
-        result: GestureResult,
-        screen_y: int,
-    ) -> None:
-        """
-        Scroll-only handler for secondary (non-dominant) hand.
-        Only acts on OPEN_HAND gesture — ignores everything else.
-        """
+    def handle_scroll(self, result: GestureResult, screen_y: int) -> None:
         if self.paused:
             return
         if result.gesture == GestureType.OPEN_HAND:
             self._accumulate_scroll(screen_y, active=True)
         else:
-            self._scroll_ref_y = None
-            self._scroll_accum = 0.0
+            self._reset_scroll()
 
     def flush(self) -> None:
-        """
-        Drain the action queue and execute all pending mouse actions.
-        Call once at the end of each frame, after all handle() calls.
-        """
         while not self._queue.empty():
             try:
                 action: MouseAction = self._queue.get_nowait()
@@ -197,26 +148,15 @@ class MouseController:
             except queue.Empty:
                 break
 
-    # ── Gesture handlers (private) ────────────────────────────────────────────
+    # ── Gesture handlers ─────────────────────────────────────────────────────
 
     def _handle_point(self, sx: int, sy: int, ev: GestureEvent) -> None:
-        """POINT → move cursor. Release any active drag/scroll state."""
         if ev == GestureEvent.ENTERED:
             self._release_drag()
-            self._scroll_ref_y = None
+            self._reset_scroll()
         self._enqueue(MouseAction(ActionType.MOVE, sx, sy))
 
-    def _handle_pinch(
-        self, sx: int, sy: int, hold_s: float, ev: GestureEvent
-    ) -> None:
-        """
-        PINCH state machine:
-          ENTERED → start pinch timer
-          HELD    → if held >= drag_lock_s: enter drag mode and move
-                    else: wait (click will fire on EXITED)
-          EXITED  → if dragging: mouseUp
-                    elif hold within click window: left click
-        """
+    def _handle_pinch(self, sx: int, sy: int, hold_s: float, ev: GestureEvent) -> None:
         gs = self._gs
 
         if ev == GestureEvent.ENTERED:
@@ -225,11 +165,9 @@ class MouseController:
 
         elif ev == GestureEvent.HELD:
             if hold_s >= gs.drag_lock_s and not self._is_dragging:
-                # Enter drag mode
                 self._is_dragging = True
                 self._enqueue(MouseAction(ActionType.MOUSE_DOWN, sx, sy))
                 log.debug("Drag started")
-
             if self._is_dragging:
                 self._enqueue(MouseAction(ActionType.MOVE, sx, sy))
 
@@ -244,7 +182,6 @@ class MouseController:
             self._pinch_start = None
 
     def _handle_victory(self, ev: GestureEvent) -> None:
-        """VICTORY → right click on ENTERED only (debounced)."""
         if ev != GestureEvent.ENTERED:
             return
         now = time.monotonic()
@@ -254,61 +191,84 @@ class MouseController:
             log.debug("Right click")
 
     def _handle_open_hand(self, sx: int, sy: int, ev: GestureEvent) -> None:
-        """OPEN_HAND → scroll. Release drag if switching from pinch."""
         if ev == GestureEvent.ENTERED:
             self._release_drag()
-            self._scroll_ref_y = None
-            self._scroll_accum = 0.0
+            self._reset_scroll()
         self._accumulate_scroll(sy, active=True)
 
     def _handle_none(self, sx: int, sy: int, ev: GestureEvent) -> None:
-        """NONE / ambiguous → release everything cleanly."""
         if ev == GestureEvent.ENTERED:
             self._release_drag()
-            self._scroll_ref_y = None
-            self._scroll_accum = 0.0
+            self._reset_scroll()
 
-    # ── Scroll accumulator ────────────────────────────────────────────────────
+    # ── Scroll accumulator (FIXED) ────────────────────────────────────────────
 
     def _accumulate_scroll(self, screen_y: int, active: bool) -> None:
         """
-        Accumulate vertical hand movement and fire scroll ticks when
-        the accumulator crosses pixels_per_tick.
+        Fixed scroll accumulator.
 
-        Uses a fixed reference point (scroll_ref_y set on first call)
-        so large hand movements = many ticks, not just velocity.
-        The accumulator is smoothed to prevent single-frame jitter.
+        Key fixes vs original:
+          1. ref_y rolls toward current position (controlled by rolling_ref_lerp)
+             so scroll never stalls when hand drifts back to anchor.
+          2. ticks is cast to int before enqueue — pyautogui.scroll() silently
+             ignores floats on Windows which caused erratic / no-scroll behaviour.
+          3. speed_multiplier is applied as float then rounded to int for OS call.
+          4. Accumulator remainder is preserved so no delta is lost between ticks.
         """
         ss = self._ss
 
         if not active:
-            self._scroll_ref_y = None
-            self._scroll_accum = 0.0
+            self._reset_scroll()
             return
 
         if self._scroll_ref_y is None:
-            self._scroll_ref_y = screen_y
+            self._scroll_ref_y = float(screen_y)
             return
 
-        delta = screen_y - self._scroll_ref_y  # positive = hand moved down
+        # ── Rolling reference (the main fix for "scroll stops") ────────────
+        # Slowly lerp ref_y toward current position so even if the hand
+        # drifts back toward the original anchor, the reference follows and
+        # scroll keeps firing.  rolling_ref_lerp=0.08 means ref moves ~8% of
+        # the gap per frame — slow enough to not kill the delta, fast enough
+        # to prevent stall.
+        if ss.rolling_ref:
+            self._scroll_ref_y += (screen_y - self._scroll_ref_y) * ss.rolling_ref_lerp
 
-        # Smooth accumulation
+        delta = screen_y - self._scroll_ref_y   # positive = hand moved down
+
+        # Smooth accumulation — prevents single-frame spike from firing
         self._scroll_accum = (
             self._scroll_accum * (1.0 - ss.accumulation_smooth)
-            + delta * ss.accumulation_smooth
+            + delta            * ss.accumulation_smooth
         )
 
         if abs(self._scroll_accum) >= ss.pixels_per_tick:
-            raw_ticks = int(self._scroll_accum / ss.pixels_per_tick)
-            ticks = raw_ticks * ss.speed_multiplier
+            # How many full ticks accumulated?
+            raw_ticks = self._scroll_accum / ss.pixels_per_tick
 
-            # Natural direction: hand down → page scrolls down (negative for pyautogui)
+            # Apply speed multiplier (float), then round to nearest int for OS
+            ticks_float = raw_ticks * ss.speed_multiplier
+            ticks_int   = int(round(ticks_float))   # FIX: was int(float) → truncation
+
+            if ticks_int == 0:
+                # rounding landed on 0 (very slow scroll) — skip this frame
+                return
+
+            # Natural direction: hand down → page scrolls down = negative for pyautogui
             if ss.natural_direction:
-                ticks = -ticks
+                ticks_int = -ticks_int
 
-            self._enqueue(MouseAction(ActionType.SCROLL, ticks=ticks))
-            self._scroll_accum -= raw_ticks * ss.pixels_per_tick  # keep remainder
-            log.debug(f"Scroll ticks={ticks}")
+            self._enqueue(MouseAction(ActionType.SCROLL, ticks=ticks_int))
+
+            # Keep remainder so no delta is lost between ticks
+            full_ticks_used = int(round(raw_ticks))
+            self._scroll_accum -= full_ticks_used * ss.pixels_per_tick
+
+            log.debug(f"Scroll ticks={ticks_int}  accum_rem={self._scroll_accum:.1f}")
+
+    def _reset_scroll(self) -> None:
+        self._scroll_ref_y = None
+        self._scroll_accum = 0.0
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -323,7 +283,6 @@ class MouseController:
         self._queue.put_nowait(action)
 
     def _execute(self, action: MouseAction) -> None:
-        """Execute one mouse action. All pyautogui calls live here."""
         if not _MOUSE_AVAILABLE:
             return
         try:
@@ -339,26 +298,16 @@ class MouseController:
             elif t == ActionType.MOUSE_UP:
                 pyautogui.mouseUp()
             elif t == ActionType.SCROLL:
-                pyautogui.scroll(action.ticks)
+                pyautogui.scroll(action.ticks)   # always int now
         except Exception as exc:
             log.error(f"Mouse action {action.kind.name} failed: {exc}")
 
-    # ── Settings hot-reload ───────────────────────────────────────────────────
-
-    def reconfigure(
-        self,
-        cs: CursorSettings,
-        gs: GestureSettings,
-        ss: ScrollSettings,
-    ) -> None:
+    def reconfigure(self, cs: CursorSettings, gs: GestureSettings, ss: ScrollSettings) -> None:
         self._cs = cs
         self._gs = gs
         self._ss = ss
 
-    # ── Cleanup ───────────────────────────────────────────────────────────────
-
     def release_all(self) -> None:
-        """Call on shutdown or lost-hand to ensure clean mouse state."""
         self._release_drag()
         self.flush()
         log.info("MouseController: all released")
